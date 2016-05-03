@@ -50,7 +50,10 @@ typedef void (*ev_callback_t)(EV_P_ ev_timer *w, int revents);
 
 /* We need this for libxkbfile */
 Display *display;
-char color[7] = "ffffff";
+char color[7] = "ffffff"; // background
+char verifycolor[7] = "00ff00"; // verify
+char wrongcolor[7] = "ff0000"; // wrong
+char idlecolor[7] = "000000"; // idle
 int inactivity_timeout = 30;
 uint32_t last_resolution[2];
 xcb_window_t win;
@@ -92,6 +95,9 @@ int blur_radius = 0;
 float blur_sigma = 0;
 bool ignore_empty_password = false;
 bool skip_repeated_empty_password = false;
+
+
+struct ev_loop *main_loop;
 
 /* isutf, u8_dec © 2005 Jeff Bezanson, public domain */
 #define isutf(c) (((c)&0xC0) != 0x80)
@@ -243,7 +249,7 @@ static void clear_input(void) {
         START_TIMER(clear_indicator_timeout, 1.0, clear_indicator_cb);
         unlock_state = STATE_BACKSPACE_ACTIVE;
         redraw_unlock_indicator();
-        unlock_state = STATE_KEY_PRESSED;
+        unlock_state = STATE_BACKSPACE_NOT_ACTIVE;
     }
 }
 
@@ -436,7 +442,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             START_TIMER(clear_indicator_timeout, 1.0, clear_indicator_cb);
             unlock_state = STATE_BACKSPACE_ACTIVE;
             redraw_unlock_indicator();
-            unlock_state = STATE_KEY_PRESSED;
+            unlock_state = STATE_BACKSPACE_NOT_ACTIVE;
             return;
     }
 
@@ -834,6 +840,21 @@ static void init_blur_coefficents() {
     }
 }
 
+int verify_hex(char *arg, char *colortype, char *varname) {
+    /* Skip # if present */
+    if (arg[0] == '#') {
+        arg++;  
+    }
+        
+    if (strlen(arg) != 6 || sscanf(arg, "%06[0-9a-fA-F]", colortype) != 1) {
+        errx(EXIT_FAILURE, "%s is invalid, it must be given in 3-byte hexadecimal format: rrggbb\n", varname);
+
+        return 0;
+    }
+        
+    return 1;
+}
+
 int main(int argc, char *argv[]) {
     struct passwd *pw;
     char *username;
@@ -861,6 +882,9 @@ int main(int argc, char *argv[]) {
         {"ignore-empty-password", no_argument, NULL, 'e'},
         {"inactivity-timeout", required_argument, NULL, 'I'},
         {"show-failed-attempts", no_argument, NULL, 'f'},
+        {"verify-color", required_argument, NULL, 'o'},
+        {"wrong-color", required_argument, NULL, 'w'},
+        {"idle-color", required_argument, NULL, 'k'},
         {NULL, no_argument, NULL, 0}};
 
     if ((pw = getpwuid(getuid())) == NULL)
@@ -868,7 +892,7 @@ int main(int argc, char *argv[]) {
     if ((username = pw->pw_name) == NULL)
         errx(EXIT_FAILURE, "pw->pw_name is NULL.\n");
 
-    char *optstring = "hvnbdc:p:ui:tfr:s:eI:l";
+    char *optstring = "hvnbdc:g:o:w:k:p:ui:tfr:s:eI:l";
     while ((o = getopt_long(argc, argv, optstring, longopts, &optind)) != -1) {
         switch (o) {
             case 'v':
@@ -889,17 +913,19 @@ int main(int argc, char *argv[]) {
                 inactivity_timeout = time;
                 break;
             }
-            case 'c': {
-                char *arg = optarg;
 
-                /* Skip # if present */
-                if (arg[0] == '#')
-                    arg++;
-
-                if (strlen(arg) != 6 || sscanf(arg, "%06[0-9a-fA-F]", color) != 1)
-                    errx(EXIT_FAILURE, "color is invalid, it must be given in 3-byte hexadecimal format: rrggbb\n");
+            case 'c': 
+                verify_hex(optarg,color, "color");
                 break;
-            }
+            case 'o':
+                verify_hex(optarg,verifycolor, "verifycolor");
+                break;
+            case 'w':
+                verify_hex(optarg,wrongcolor, "wrongcolor");
+                break;
+            case 'k':
+                verify_hex(optarg,idlecolor, "idlecolor");
+                break;
             case 'u':
                 unlock_indicator = false;
                 break;
@@ -1124,6 +1150,10 @@ int main(int argc, char *argv[]) {
     ev_invoke(main_loop, xcb_check, 0);
     /* usually fork is called from mapnotify event handler, but in our case
      * a new window is not created and so the mapnotify event doesn't come */
+
+    start_time_redraw_tick(main_loop);
+    redraw_unlock_indicator();
+
     if (fuzzy && !dont_fork) {
         dont_fork = true;
 
@@ -1133,5 +1163,6 @@ int main(int argc, char *argv[]) {
 
         ev_loop_fork(EV_DEFAULT);
     }
+
     ev_loop(main_loop, 0);
 }

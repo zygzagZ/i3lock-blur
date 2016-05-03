@@ -60,8 +60,31 @@ extern bool tile;
 extern bool fuzzy;
 extern int blur_radius;
 extern float blur_sigma;
+
 /* The background color to use (in hex). */
 extern char color[7];
+
+
+extern char verifycolor[7];
+extern char wrongcolor[7];
+extern char idlecolor[7];
+uint8_t colors[4][4];
+void start_anim_redraw_tick(struct ev_loop* loop);
+static struct ev_periodic *time_redraw_tick;
+static struct ev_timer anim_redraw_tick;
+static bool anim_redraw_tick_running;
+struct anim_t {
+	float arc_start;
+	float arc_end;
+	char time;
+} static anims[64];
+static int anim_id;
+extern struct ev_loop* main_loop;
+#define TIME_FORMAT "%H:%M"
+// effectively its 2 times FRAMES per keypress animation
+#define ANIM_FRAMES 6
+// #define FILL_ANIM_FRAMES 4
+
 extern Display *display;
 
 /* Whether the failed attempts should be displayed. */
@@ -102,6 +125,44 @@ static double scaling_factor(void) {
     return (dpi / 96.0);
 }
 
+/* Sets the color based on argument (color/background, verify, wrong, idle)
+ * and type (line, background and fill). Type defines alpha value and tint.
+ * Utilizes color_array() and frees after use.
+ */
+void set_color(cairo_t *cr, char *colorarg, char colortype, double alpha) {
+	uint8_t offset = 0;
+	if (colorarg == verifycolor)
+		offset = 1;
+	else if (colorarg == wrongcolor)
+		offset = 2;
+	else if (colorarg == idlecolor)
+		offset = 3;
+
+	if (!colors[offset][3]) {
+		char strgroups[3][3] = {{colorarg[0], colorarg[1], '\0'},
+								{colorarg[2], colorarg[3], '\0'},
+								{colorarg[4], colorarg[5], '\0'}};
+
+		for (int i=0; i < 3; i++) {
+			colors[offset][i] = (uint8_t)strtol(strgroups[i], NULL, 16);
+		}
+		colors[offset][3] = 1;
+	}
+
+	switch(colortype) {
+		case 'b': /* Background */
+			cairo_set_source_rgb(cr, colors[offset][0] / 255.0, colors[offset][1] / 255.0, colors[offset][2] / 255.0);
+			break;
+		case 'l': /* Line and text */
+			cairo_set_source_rgba(cr, colors[offset][0] / 255.0, colors[offset][1] / 255.0, colors[offset][2] / 255.0, alpha*0.8);
+			break;
+		case 'f': /* Fill */
+			/* Use a lighter tint of the user defined color for circle fill */
+			cairo_set_source_rgba(cr, (255-colors[offset][0]) * 0.5 + colors[offset][0], (255-colors[offset][1])*0.5 + colors[offset][1], (255-colors[offset][2])*0.5 + colors[offset][2], 0.15);
+			break;
+	}
+}
+
 static void draw_unlock_indicator() {
     /* Initialise the surface if not yet done */
     if (unlock_indicator_surface == NULL) {
@@ -118,7 +179,7 @@ static void draw_unlock_indicator() {
     cairo_paint(ctx);
     cairo_restore(ctx);
 
-    if (unlock_state >= STATE_KEY_PRESSED && unlock_indicator) {
+    if (unlock_state >= STATE_KEY_PRESSED && unlock_indicator && false) {
         cairo_scale(ctx, scaling_factor(), scaling_factor());
         /* Draw a (centered) circle with transparent background. */
         cairo_set_line_width(ctx, 10.0);
@@ -267,6 +328,145 @@ static void draw_unlock_indicator() {
             cairo_stroke(ctx);
         }
     }
+    if (unlock_indicator) {
+		cairo_scale(ctx, scaling_factor(), scaling_factor());
+		/* Draw a (centered) circle with transparent background. */
+		cairo_set_line_width(ctx, 3.0);
+		cairo_arc(ctx,
+				  BUTTON_CENTER /* x */,
+				  BUTTON_CENTER /* y */,
+				  BUTTON_RADIUS /* radius */,
+				  0 /* start */,
+				  2 * M_PI /* end */);
+
+		/* Use the appropriate color for the different PAM states
+		 * (currently verifying, wrong password, or idle) 
+		 */
+
+		void set_pam_color(char colortype, double alpha) {
+			switch (pam_state) {
+				case STATE_PAM_VERIFY:
+					set_color(ctx,verifycolor,colortype,alpha);
+					break;
+				case STATE_PAM_WRONG:
+					set_color(ctx,wrongcolor,colortype,alpha);
+					break;
+				case STATE_PAM_IDLE:
+					if (unlock_state == STATE_BACKSPACE_ACTIVE || unlock_state == STATE_BACKSPACE_NOT_ACTIVE) {
+						set_color(ctx,wrongcolor,colortype,alpha);
+					}
+					else {
+						set_color(ctx,idlecolor,colortype,alpha);  
+					}
+					break;
+			}
+		}
+		/*int latest_anim_time = FILL_ANIM_FRAMES*2;
+
+		if (unlock_state == STATE_KEY_ACTIVE ||
+		 	unlock_state == STATE_BACKSPACE_ACTIVE) {
+		 	latest_anim_time = 0;
+		} else {
+			for (int anim = 0; anim < anim_id; anim++) {
+				if (anims[anim].time < latest_anim_time) {
+					latest_anim_time = anims[anim].time;
+				}
+			}
+		}*/
+		double f_opacity = 1.0;
+		/*if (latest_anim_time < FILL_ANIM_FRAMES*2) {
+			if (latest_anim_time <= FILL_ANIM_FRAMES) {
+				f_opacity = (double)latest_anim_time / (double)FILL_ANIM_FRAMES;
+			} else {
+				f_opacity = 1. - ((double)(latest_anim_time - FILL_ANIM_FRAMES) / (double)FILL_ANIM_FRAMES);
+			}
+			f_opacity = 1.-f_opacity;
+		}*/
+
+		set_pam_color('f', f_opacity);
+		cairo_fill_preserve(ctx);
+
+		/* Circle border */
+		set_pam_color('l', 1.0);
+		cairo_stroke(ctx);
+
+		/* After the user pressed any valid key or the backspace key, we
+		 * highlight a random part of the unlock indicator to confirm this
+		 * keypress. */
+		 if (unlock_state == STATE_KEY_ACTIVE ||
+		 	unlock_state == STATE_BACKSPACE_ACTIVE) {
+		 	cairo_set_line_width(ctx, 4);
+			cairo_new_sub_path(ctx);
+			double highlight_start = (rand() % (int)(2 * M_PI * 100)) / 100.0;
+
+			anims[anim_id].arc_start = highlight_start;
+			anims[anim_id].arc_end = highlight_start + (M_PI / 2.5);
+			anims[anim_id].time = 0;
+
+			anim_id++;
+
+			start_anim_redraw_tick(main_loop);
+		}
+
+		for (int anim = 0; anim < anim_id; anim++) {
+			cairo_arc(ctx,
+				BUTTON_CENTER /* x */,
+				BUTTON_CENTER /* y */,
+				BUTTON_RADIUS /* radius */,
+				anims[anim].arc_start,
+				anims[anim].arc_end);
+			
+			if (anims[anim].time <= ANIM_FRAMES) {
+				set_pam_color('l', anims[anim].time / (double)ANIM_FRAMES);
+				cairo_set_line_width(ctx, 4.0);
+			} else {
+				set_pam_color('l', 1. - ((anims[anim].time - ANIM_FRAMES) / (double)ANIM_FRAMES));
+				cairo_set_line_width(ctx, 3.0);
+			}
+
+			cairo_set_operator(ctx,CAIRO_OPERATOR_DEST_OUT);
+
+			cairo_stroke(ctx);
+
+			anims[anim].time++;
+			if (anims[anim].time > 2*ANIM_FRAMES) {
+				memmove(anims + anim, anims + anim + 1, sizeof(struct anim_t) * (anim_id - anim));
+				anim--;
+				anim_id--;
+				if (anim_id == 0) {
+					ev_timer_stop(main_loop, &anim_redraw_tick);
+					anim_redraw_tick_running = 0;
+				}
+			}
+		}
+
+		cairo_set_operator(ctx, CAIRO_OPERATOR_OVER);
+
+
+		/* Display (centered) Time */
+		char *timetext = malloc(20);
+
+		time_t curtime = time(NULL);
+		struct tm *tm = localtime(&curtime);
+		strftime(timetext, 100, TIME_FORMAT, tm);
+
+		/* Text */
+		set_pam_color('l', 1.0);
+		cairo_set_font_size(ctx, 32.0);
+
+		cairo_text_extents_t time_extents;
+		double time_x, time_y;
+
+		cairo_text_extents(ctx, timetext, &time_extents);
+		time_x = BUTTON_CENTER - ((time_extents.width / 2) + time_extents.x_bearing);
+		time_y = BUTTON_CENTER - ((time_extents.height / 2) + time_extents.y_bearing);
+
+		cairo_move_to(ctx, time_x, time_y);
+		cairo_show_text(ctx, timetext);
+		cairo_close_path(ctx);
+
+		free(timetext);
+	}
 
     cairo_destroy(ctx);
 }
@@ -413,3 +613,31 @@ void resize_screen(void) {
     cairo_surface_destroy(unlock_indicator_surface);
     unlock_indicator_surface = NULL;
 }
+
+
+static void time_redraw_cb(struct ev_loop *loop, ev_periodic *w, int revents) {
+	redraw_unlock_indicator();
+}
+
+void start_time_redraw_tick(struct ev_loop* main_loop) {
+	if (time_redraw_tick) {
+		ev_periodic_set(time_redraw_tick, 1.0, 60., 0);
+		ev_periodic_again(main_loop, time_redraw_tick);
+	} else {
+		/* When there is no memory, we just don’t have a timeout. We cannot
+		* exit() here, since that would effectively unlock the screen. */
+		if (!(time_redraw_tick = calloc(sizeof(struct ev_periodic), 1)))
+		return;
+		ev_periodic_init(time_redraw_tick,time_redraw_cb, 1.0, 60., 0);
+		ev_periodic_start(main_loop, time_redraw_tick);
+	}
+}
+
+void start_anim_redraw_tick(struct ev_loop* loop) {
+	if (!anim_redraw_tick_running) {
+		anim_redraw_tick_running = 1;
+		ev_timer_init(&anim_redraw_tick, time_redraw_cb, .0266, .0266); // its about 50 fps?
+		ev_timer_start(loop, &anim_redraw_tick);
+	}
+}
+
